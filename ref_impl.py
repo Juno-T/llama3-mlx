@@ -29,4 +29,4 @@ def apply_rope_scaling(freqs: mx.array) -> mx.array:
             new_freqs.append((1 - smooth) * freq /
                              scale_factor + smooth * freq)
     freqs = torch.tensor(new_freqs, dtype=freqs.dtype).cpu().numpy()
-    return mx.array(freq, dtype=mx.float32)
+    return mx.array(freqs, dtype=mx.float32)
