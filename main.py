@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict
 import mlx.core as mx
 from functools import partial
@@ -33,11 +34,14 @@ def embed_token_vmapped(embedding_table, tokens):
     return embed_token(embedding_table, tokens)
 
 
-def precompute_rope_cos_sin(max_positions, emb_dim, base_theta=10000.0, stream=mx.cpu):
+def precompute_rope_cos_sin(max_positions, emb_dim, base_theta=10000.0, use_scaled_rope=True, stream=mx.cpu):
     d = emb_dim
     theta_i = mx.power(
         base_theta, (-2 * mx.divide(mx.arange(0, d // 2), d, stream=stream)), stream=stream)
 
+    if use_scaled_rope:
+        from .ref_impl import apply_rope_scaling
+        theta_i = apply_rope_scaling(theta_i)
     indices = mx.stack([mx.arange(0, d // 2)]*2).T.flatten()  # (d,)
     positions = mx.arange(0, max_positions)  # (max_positions,)
     # (max_positions, d)
@@ -91,42 +95,49 @@ def apply_multihead_self_attn(
         W_O: mx.array,
         cos: mx.array,
         sin: mx.array,
-        context_size: int,
         num_heads: int,
+        num_kv_heads: int,
         attn_dim: int):
-    # (context_size, num_heads * attn_dim) = [[q1], [q2], [q3]]
+    seq_len = x.shape[0]
+    num_reps = num_heads // num_kv_heads
+    # (seq_len, num_heads * attn_dim) = [[q1], [q2], [q3]]
     Q = mx.matmul(x, W_Q.T)
-    # (context_size, num_heads * attn_dim) = [[k1], [k2], [k3]]
+    # (seq_len, num_kv_heads * attn_dim) = [[k1], [k2], [k3]]
     K = mx.matmul(x, W_K.T)
-    # (context_size, num_heads * attn_dim) = [[v1], [v2], [v3]]
+    # (seq_len, num_kv_heads * attn_dim) = [[v1], [v2], [v3]]
     V = mx.matmul(x, W_V.T)
 
-    Q = Q.reshape(context_size, num_heads, attn_dim).transpose(
-        1, 0, 2)  # (num_heads, context_size, attn_dim)
-    K = K.reshape(context_size, num_heads, attn_dim).transpose(
-        1, 0, 2)  # (num_heads, context_size, attn_dim)
+    Q = Q.reshape(seq_len, num_heads, attn_dim).transpose(
+        1, 0, 2)  # (num_heads, seq_len, attn_dim)
+    K = K.reshape(seq_len, num_kv_heads, attn_dim).transpose(
+        1, 0, 2)  # (num_kv_heads, seq_len, attn_dim)
+    V = V.reshape(seq_len, num_kv_heads, attn_dim).transpose(
+        1, 0, 2)  # (num_kv_heads, seq_len, attn_dim)
+
     Q, K = apply_rope(Q, K, cos, sin, expand_axis=1)
-    V = V.reshape(context_size, num_heads, attn_dim).transpose(
-        1, 0, 2)  # (num_heads, context_size, attn_dim)
-    # Q.shape
+    # (num_kv_heads * num_reps = num_heads, seq_len, attn_dim)
+    K = mx.concatenate([K] * num_reps)
+    # (num_kv_heads * num_reps = num_heads, seq_len, attn_dim)
+    V = mx.concatenate([V] * num_reps)
+
     attn_score = mx.matmul(Q, K.transpose(0, -1, -2))
-    # (num_heads, context_size, context_size)
+    # (num_heads, seq_len, seq_len)
     attn_score = mx.softmax(attn_score / mx.sqrt(attn_dim), axis=-1)
 
-    # (num_heads, context_size, attn_dim)
+    # (num_heads, seq_len, attn_dim)
     delta_x_down = mx.matmul(attn_score, V)
     delta_x_down = delta_x_down.transpose(1, 0, 2).reshape(
-        context_size, num_heads * attn_dim)
+        seq_len, num_heads * attn_dim)
 
     delta_x = mx.matmul(delta_x_down, W_O.T)
 
-    # Q.reshape(-1, num_heads, attn_dim).transpose(-2, 0, -1) # (num_head, context_size, attn_dim)
+    # Q.reshape(-1, num_heads, attn_dim).transpose(-2, 0, -1) # (num_head, seq_len, attn_dim)
     # mx.stack(mx.split(Q, num_heads, axis=-1)).shape
-    # attn_score = mx.matmul(Q, K.T) # (context_size, context_size) = [[q1k1, q1k2, q1k3], [q2k1, q2k2, q2k3], [q3k1, q3k2, q3k3]]
-    # delta_x_down = mx.matmul(attn_score, V) # (context_size, attn_dim) = [[q1k1v1 + q1k2v2 + q1k3v3], [q2k1v1 + q2k2v2 + q2k3v3], [q3k1v1 + q3k2v2 + q3k3v3]]
+    # attn_score = mx.matmul(Q, K.T) # (seq_len, seq_len) = [[q1k1, q1k2, q1k3], [q2k1, q2k2, q2k3], [q3k1, q3k2, q3k3]]
+    # delta_x_down = mx.matmul(attn_score, V) # (seq_len, attn_dim) = [[q1k1v1 + q1k2v2 + q1k3v3], [q2k1v1 + q2k2v2 + q2k3v3], [q3k1v1 + q3k2v2 + q3k3v3]]
 
     # # attn_dim -> emb_dim
-    # delta_x = mx.matmul(delta_x_down, W_O) # (context_size, emb_dim)
+    # delta_x = mx.matmul(delta_x_down, W_O) # (seq_len, emb_dim)
     # delta_x.shape
 
     # residual
@@ -145,13 +156,13 @@ def gated_mlp(x, W_gate, W_up, W_down):
     But no explanation on why it works better, or why llama use it.
 
     # x: (context_size, emb_dim)
-    # W_gate: (emb_dim, hidden_dim)
-    # W_up: (hidden_dim, emb_dim)
-    # W_down: (emb_dim, hidden_dim)
+    # W_gate: (emb_dim, ffn_hidden_dim)
+    # W_up: (ffn_hidden_dim, emb_dim)
+    # W_down: (emb_dim, ffn_hidden_dim)
     """
-    x1 = mx.matmul(x, W_gate)  # (context_size, hidden_dim)
+    x1 = mx.matmul(x, W_gate)  # (context_size, ffn_hidden_dim)
     x1 = silu(x1)
-    x3 = mx.matmul(x, W_up)  # (context_size, hidden_dim)
+    x3 = mx.matmul(x, W_up)  # (context_size, ffn_hidden_dim)
     return mx.matmul(x1 * x3, W_down)
 
 
@@ -176,16 +187,15 @@ def transformer_block(
     W_down: mx.array,
     W_rms_norm: mx.array,
     rms_eps: float,
-    context_size: int,
     num_heads: int,
+    num_kv_heads: int,
     attn_dim: int
 ) -> mx.array:
-    h = rms_norm(x, W_rms_norm, rms_eps)
-    h = x + apply_multihead_self_attn(
-        h, W_Q, W_K, W_V, W_O, cos, sin, context_size, num_heads, attn_dim)
-    h_norm = rms_norm(h, W_rms_norm, rms_eps)
-    out = h + gated_mlp(h_norm, W_gate, W_up, W_down)
-    return out
+    h1 = rms_norm(x, W_rms_norm, rms_eps)
+    h1 = x + apply_multihead_self_attn(
+        h1, W_Q, W_K, W_V, W_O, cos, sin, num_heads, num_kv_heads, attn_dim)
+    h2 = rms_norm(h1, W_rms_norm, rms_eps)
+    return h1 + gated_mlp(h2, W_gate, W_up, W_down)
 
 
 def llama(
@@ -196,18 +206,21 @@ def llama(
     rms_eps: float = hparams["rms_eps"]
     context_size: int = hparams["context_size"]
     num_heads: int = hparams["num_heads"]
+    num_kv_heads: int = hparams["num_kv_heads"]
     attn_dim: int = hparams["attn_dim"]
     num_layers: int = hparams["num_layers"]
     vocab_size: int = hparams["vocab_size"]
     emb_dim: int = hparams["emb_dim"]
-    hidden_dim: int = hparams["hidden_dim"]
+    ffn_hidden_dim: int = hparams["ffn_hidden_dim"]
     rope_theta: float = hparams["rope_theta"]
+    use_scaled_rope: bool = hparams["use_scaled_rope"]
 
     _bsz, seqlen = tokens.shape
 
     embedding_table = weights["model.embedding_table"]
     h = embed_token_vmapped(embedding_table, tokens)
-    cos, sin = precompute_rope_cos_sin(context_size, attn_dim, rope_theta)
+    cos, sin = precompute_rope_cos_sin(
+        context_size * 2, attn_dim, rope_theta, use_scaled_rope)
 
     # mask = None
     # if seqlen > 1:
@@ -245,8 +258,8 @@ def llama(
             W_down,
             W_rms_norm,
             rms_eps,
-            context_size,
             num_heads,
+            num_kv_heads,
             attn_dim,
         )
     W_rms_norm = weights["model.norm_out.W_rms_norm"]
@@ -270,7 +283,7 @@ def load_hparams(hparams_path: str):
     import json
     with open(hparams_path) as f:
         hparams_llama = json.load(f)
-    # {
+    # hparams_llama = {
     #   "dim": 2048,
     #   "ffn_dim_multiplier": 1.5,
     #   "multiple_of": 256,
@@ -286,17 +299,43 @@ def load_hparams(hparams_path: str):
         "emb_dim": hparams_llama["dim"],
         "attn_dim": None,                           # ? To be calculated
         "num_heads": hparams_llama["n_heads"],
-        "num_kv_heads": hparams_llama["n_kv_heads"],  # ! What is this?
+        "num_kv_heads": hparams_llama["n_kv_heads"],
         "num_layers": hparams_llama["n_layers"],
         "vocab_size": hparams_llama["vocab_size"],
-        "context_size": None,                       # ? To be calculated
-        "hidden_dim": None,                         # ? To be calculated
+        "context_size": None,                       # ! Not presented
+        "ffn_hidden_dim": None,                         # ? To be calculated
         "rms_eps": hparams_llama["norm_eps"],
         "rope_theta": hparams_llama["rope_theta"],
-        "use_scaled_rope": hparams_llama["use_scaled_rope"],  # ! What is this?
+        "use_scaled_rope": hparams_llama["use_scaled_rope"],
     }
+    hparams["attn_dim"] = hparams["emb_dim"] // hparams["num_heads"]
+
+    def llama_ffn_hidden_dim_calculator(dim, multiple_of, ffn_dim_multiplier):
+        hidden_dim = dim * 4
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * \
+            ((hidden_dim + multiple_of - 1) // multiple_of)
+        return hidden_dim
+
+    hparams["ffn_hidden_dim"] = llama_ffn_hidden_dim_calculator(
+        hparams["attn_dim"], hparams_llama["multiple_of"], hparams_llama["ffn_dim_multiplier"]
+    )
+    hparams["context_size"] = 8192
+
     return hparams
 
 
+def load_tokenizer(tokenizer_path: str):
+    from llama_models.llama3.api import Tokenizer
+    return Tokenizer(tokenizer_path)
+
+
 if __name__ == "__main__":
-    weights = load_weights("llama3.pt")
+    model_dir = "../weights/checkpoints/Llama3.2-1B"
+    weights = load_weights(os.path.join(model_dir, "consolidated.00.pth"))
+    hparams = load_hparams(os.path.join(model_dir, "hparams.json"))
+    tokenizer = load_tokenizer(os.path.join(model_dir, "tokenizer.model"))
+    hparams["model_path"] = model_dir
