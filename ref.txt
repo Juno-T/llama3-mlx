@@ -1,0 +1,5 @@
+https://github.com/meta-llama/llama3/blob/main/llama/model.py
+
+https://gist.github.com/yacineMTB/8ea60050a18e0b613f3dfd0cb4955625
+
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py#L286
