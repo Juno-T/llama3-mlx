@@ -4,6 +4,8 @@ import mlx.core as mx
 from functools import partial
 
 
+from llama_models.llama3.api import Tokenizer
+
 # vocab_size = 4096
 # emb_dim = 2222
 
@@ -33,8 +35,6 @@ def embed_token(embedding_table, tokens):
 def embed_token_vmapped(embedding_table, tokens):
     return embed_token(embedding_table, tokens)
 
-# * Verified
-
 
 def precompute_rope_cos_sin(max_positions, attn_dim, base_theta=10000.0, use_scaled_rope=True, stream=mx.cpu):
     d = attn_dim
@@ -52,8 +52,6 @@ def precompute_rope_cos_sin(max_positions, attn_dim, base_theta=10000.0, use_sca
     sin = mx.sin(pos_theta_i, stream=stream)  # (max_positions, d)
     # (1, max_positions, d)
     return mx.expand_dims(cos, axis=0), mx.expand_dims(sin, axis=0)
-
-# * Verified
 
 
 def apply_rope(q, k, cos, sin, expand_axis=1):
@@ -180,12 +178,12 @@ def gated_mlp(x: mx.array, W_gate: mx.array, W_up: mx.array, W_down: mx.array):
     return mx.matmul(x1 * x3, W_down.T)
 
 
-def rms_norm(hidden_states: mx.array, weight: mx.array, eps: float = 1e-6):
-    original_dtype = hidden_states.dtype
-    hidden_states = hidden_states.astype(mx.float32)
-    variance = mx.power(hidden_states, 2).mean(-1, keepdims=True)
-    hidden_states = hidden_states * mx.rsqrt(variance + eps)
-    return (weight * hidden_states).astype(original_dtype)
+def rms_norm(x: mx.array, weight: mx.array, eps: float = 1e-5):
+    original_dtype = x.dtype
+    x = x.astype(mx.float32)
+    variance = mx.power(x, 2).mean(-1, keepdims=True)
+    x = x * mx.rsqrt(variance + eps)
+    return (weight * x).astype(original_dtype)
 
 
 def transformer_block(
@@ -200,22 +198,23 @@ def transformer_block(
     W_gate: mx.array,
     W_up: mx.array,
     W_down: mx.array,
-    W_rms_norm: mx.array,
+    W_attn_rms_norm: mx.array,
+    W_ffn_rms_norm: mx.array,
     rms_eps: float,
     num_heads: int,
     num_kv_heads: int,
     attn_dim: int
 ) -> mx.array:
-    h1 = rms_norm(x, W_rms_norm, rms_eps)
-    h1 = x + apply_multihead_self_attn(
-        h1, mask, W_Q, W_K, W_V, W_O, cos, sin, num_heads, num_kv_heads, attn_dim)
-    h2 = rms_norm(h1, W_rms_norm, rms_eps)
-    return h1 + gated_mlp(h2, W_gate, W_up, W_down)
+    h = x + apply_multihead_self_attn(
+        rms_norm(x, W_attn_rms_norm, rms_eps),
+        mask, W_Q, W_K, W_V, W_O, cos, sin, num_heads, num_kv_heads, attn_dim)
+    return h + gated_mlp(
+        rms_norm(h, W_ffn_rms_norm, rms_eps), W_gate, W_up, W_down)
 
 
 def create_causal_mask(seq_len: int, dtype: mx.Dtype = mx.float32):
-    mask = mx.triu(mx.ones((seq_len, seq_len),
-                   dtype=mx.float32) * -mx.inf, k=1)
+    mask = mx.triu(mx.ones((seq_len, seq_len,),
+                   dtype=dtype) * -mx.inf, k=1)
     return mask
 
 
@@ -254,7 +253,8 @@ def llama(
         W_gate = weights[f"layers.{l}.feed_forward.w1.weight"]
         W_up = weights[f"layers.{l}.feed_forward.w3.weight"]
         W_down = weights[f"layers.{l}.feed_forward.w2.weight"]
-        W_rms_norm = weights[f"norm.weight"]
+        W_attn_rms_norm = weights[f"layers.{l}.attention_norm.weight"]
+        W_ffn_rms_norm = weights[f"layers.{l}.ffn_norm.weight"]
         h = transformer_block(
             h,
             mask,
@@ -267,7 +267,8 @@ def llama(
             W_gate,
             W_up,
             W_down,
-            W_rms_norm,
+            W_attn_rms_norm,
+            W_ffn_rms_norm,
             rms_eps,
             num_heads,
             num_kv_heads,
@@ -280,17 +281,14 @@ def llama(
     return output
 
 
-def generate():
-    pass
-
-
 def load_weights(weight_path: str):
     import torch
     weights_pt = torch.load(weight_path, map_location="cpu")
     keys = list(weights_pt.keys())
     weights = {}
     for k in keys:
-        weights[k] = mx.array(weights_pt[k].to(torch.float32).numpy())
+        weights[k] = mx.array(weights_pt[k].to(
+            torch.float32).numpy(), dtype=mx.float32)
         del weights_pt[k]
     return weights
 
@@ -345,14 +343,13 @@ def load_hparams(hparams_path: str):
 
 
 def load_tokenizer(tokenizer_path: str):
-    from llama_models.llama3.api import Tokenizer
     return Tokenizer(tokenizer_path)
 
 
 def generate(
         text,
         model,
-        tokenizer,
+        tokenizer: Tokenizer,
         top_k=10,
         temperature=1,
         max_generation=20,
