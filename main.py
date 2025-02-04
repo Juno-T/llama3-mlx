@@ -131,11 +131,11 @@ def apply_multihead_self_attn(
     )
 
     attn_score = mx.matmul(Q, K.transpose(0, 1, 3, 2)
-                           ) / (attn_dim ** -0.5)  # .transpose(0, 1, 3, 2)
+                           ) / (attn_dim ** 0.5)
     # (bsz, num_heads, seq_len, seq_len)
     # attn_score = mx.softmax(attn_score / mx.sqrt(attn_dim), axis=-1)
+    # print(attn_score[0, 15, -1], (attn_dim ** -0.5), attn_score.shape)
     attn_score = mx.softmax(attn_score + mask, axis=-1)
-
     # (bsz, num_heads, seq_len, attn_dim)
     delta_x_down = mx.matmul(attn_score, V)
     delta_x_down = delta_x_down.transpose(0, 2, 1, 3).reshape(
@@ -245,6 +245,10 @@ def llama(
 
     mask = create_causal_mask(seq_len)
 
+    # q = mx.array(mx.arange(emb_dim * 10, dtype=mx.float32)
+    #              ).reshape(1, 10, emb_dim)
+    # mask = create_causal_mask(10)
+
     for l in range(num_layers):
         W_Q = weights[f"layers.{l}.attention.wq.weight"]
         W_K = weights[f"layers.{l}.attention.wk.weight"]
@@ -255,6 +259,10 @@ def llama(
         W_down = weights[f"layers.{l}.feed_forward.w2.weight"]
         W_attn_rms_norm = weights[f"layers.{l}.attention_norm.weight"]
         W_ffn_rms_norm = weights[f"layers.{l}.ffn_norm.weight"]
+        # q = apply_multihead_self_attn(
+        #     q, mask, W_Q, W_K, W_V, W_O, cos, sin, num_heads, num_kv_heads, attn_dim)
+        # print(q[0, 0], q.shape)
+        # raise Exception
         h = transformer_block(
             h,
             mask,
@@ -350,9 +358,9 @@ def generate(
         text,
         model,
         tokenizer: Tokenizer,
-        top_k=10,
+        top_k=100,
         temperature=1,
-        max_generation=20,
+        max_generation=50,
         context_size=2048,
         seed=42):
     import numpy as np
@@ -377,14 +385,9 @@ def generate(
         tokens.append(next_token)
         heatmap.append(np.array(probs)[:500])
 
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-    sns.heatmap(np.array(heatmap))
-    plt.savefig("heatmap.png")
-
 
 if __name__ == "__main__":
-    model_dir = "./weights/checkpoints/Llama3.2-1B"
+    model_dir = "./weights/checkpoints/Llama3.2-1B-Instruct"
     weights = load_weights(os.path.join(model_dir, "consolidated.00.pth"))
     hparams = load_hparams(os.path.join(model_dir, "params.json"))
     tokenizer = load_tokenizer(os.path.join(model_dir, "tokenizer.model"))
@@ -394,10 +397,19 @@ if __name__ == "__main__":
     model = partial(llama, weights, hparams)
 
     prompt = """
-System: You are a helpful assistant.
+System: You are an expert in Japan tourist guide. You must answer with an elaborated response that is a complete sentence.
 User: Hello
-Assistant: Hello, how can I help you today?
+Assistant: Hello, how can I help you today? I can introduce you to some of the most popular tourist attractions in Japan.
 User: {sentence}
 Assistant:"""
-    sentence = "Hello, how are you?"
-    generate(prompt.format(sentence=sentence), model, tokenizer)
+    sentence = "What is your favorite place in Japan?"
+    generate(
+        prompt.format(sentence=sentence),
+        model,
+        tokenizer,
+        top_k=100,
+        temperature=1,
+        max_generation=50,)
+
+    # Example response:
+    # "I like to visit the Japanese garden. It is a place where you can relax and enjoy the beautiful"
