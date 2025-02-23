@@ -1,6 +1,6 @@
 # Llama3 from scratch with MLX
 
-This is a nanoGPT-like implementation of llama3 architecture model from scratch using apple's `mlx` python library. Most of the things are implemented from scratch and no `nn` module is used. It will also work if you just swap in `numpy`.
+This is a nanoGPT-like implementation of llama3 architecture model from scratch using apple's `mlx` python library. Most of the things are implemented from scratch and no `nn` module used. It will also work if you just swap in `numpy`.
 
 ## Setup
 1. Install packages.
